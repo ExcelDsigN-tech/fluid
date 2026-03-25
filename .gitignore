@@ -48,3 +48,5 @@ wasm-pack-v0.14.0-x86_64-pc-windows-msvc/
 # Test coverage
 coverage/
 .nyc_output/
+issue.md
+pr.md

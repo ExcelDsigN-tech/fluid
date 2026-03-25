@@ -27,3 +27,4 @@ crate-type = ["cdylib", "rlib"]
 wasm-opt = false
 stellar-xdr = { version = "22", features = ["curr"] }
 base64 = "0.22"
+dashmap = "6.0"
