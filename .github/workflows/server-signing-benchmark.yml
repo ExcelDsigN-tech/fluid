@@ -2,11 +2,10 @@ name: Server Signing Benchmark
 
 on:
   push:
-    paths-ignore:
-      - "server/benchmarks/signing-report.md"
     paths:
       - ".github/workflows/server-signing-benchmark.yml"
       - "server/**"
+      - "!server/benchmarks/signing-report.md"
   workflow_dispatch:
 
 permissions:
