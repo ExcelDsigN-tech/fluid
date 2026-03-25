@@ -9,6 +9,7 @@
     "native:build": "napi build --release",
     "native:build:debug": "napi build",
     "benchmark:signing": "npm run native:build && ts-node src/benchmarks/signing.ts",
+    "demo:horizon-failover": "node scripts/horizonFailoverDemo.mjs",
     "start": "node dist/index.js",
     "dev": "ts-node src/index.ts",
     "watch": "tsc --watch"

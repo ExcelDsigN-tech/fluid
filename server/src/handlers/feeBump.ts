@@ -1,68 +1,60 @@
-import { Request, Response, NextFunction } from "express";
+import { NextFunction, Request, Response } from "express";
 import StellarSdk from "@stellar/stellar-sdk";
-import { Config } from "../config";
-import { FeeBumpSchema, FeeBumpRequest } from "../schemas/feeBump";
+import { Config, pickFeePayerAccount } from "../config";
+import { AppError } from "../errors/AppError";
 import { ApiKeyConfig } from "../middleware/apiKeys";
 import { syncTenantFromApiKey } from "../models/tenantStore";
 import { recordSponsoredTransaction } from "../models/transactionLedger";
+import { FeeBumpRequest, FeeBumpSchema } from "../schemas/feeBump";
 import { checkTenantDailyQuota } from "../services/quota";
-import { transactionStore } from "../workers/transactionStore";
-import { AppError } from "../errors/AppError";
-
 import { calculateFeeBumpFee } from "../utils/feeCalculator";
-interface FeeBumpRequest {
-  xdr: string;
-  submit?: boolean;
-  token?: string;
-}
+import { getHorizonFailoverClient } from "../horizon/failoverClient";
+import { transactionStore } from "../workers/transactionStore";
 
 interface FeeBumpResponse {
   xdr: string;
-  status: string;
+  status: "ready" | "submitted";
   hash?: string;
   fee_payer: string;
+  submitted_via?: string;
+  submission_attempts?: number;
 }
 
 export async function feeBumpHandler(
   req: Request,
   res: Response,
-  next: NextFunction,
-  config: Config
+  config: Config,
+  next: NextFunction
 ): Promise<void> {
   try {
-    const result = FeeBumpSchema.safeParse(req.body);
+    const parsedBody = FeeBumpSchema.safeParse(req.body);
 
-    if (!result.success) {
+    if (!parsedBody.success) {
       console.warn(
         "Validation failed for fee-bump request:",
-        result.error.format()
+        parsedBody.error.format()
       );
       return next(
         new AppError(
-          `Validation failed: ${JSON.stringify(result.error.format())}`,
+          `Validation failed: ${JSON.stringify(parsedBody.error.format())}`,
           400,
           "INVALID_XDR"
         )
       );
-      
-      const body: FeeBumpRequest = req.body;
-      if (!body.xdr) {
-        res.status(400).json({ error: "Missing 'xdr' field in request body" });
-        return;
-      }
     }
 
-    // Pick a fee payer account using Round Robin
+    const body: FeeBumpRequest = parsedBody.data;
     const feePayerAccount = pickFeePayerAccount(config);
-    console.log(`Received fee-bump request | fee_payer: ${feePayerAccount.publicKey}`);
+    console.log(
+      `Received fee-bump request | fee_payer: ${feePayerAccount.publicKey}`
+    );
 
     let innerTransaction: any;
-
     try {
       innerTransaction = StellarSdk.TransactionBuilder.fromXDR(
         body.xdr,
-        config.networkPassphrase,
-      );
+        config.networkPassphrase
+      ) as any;
     } catch (error: any) {
       console.error("Failed to parse XDR:", error.message);
       return next(
@@ -80,7 +72,7 @@ export async function feeBumpHandler(
       );
     }
 
-    if ("feeBumpTransaction" in innerTransaction) {
+    if ("innerTransaction" in innerTransaction) {
       return next(
         new AppError(
           "Cannot fee-bump an already fee-bumped transaction",
@@ -90,17 +82,24 @@ export async function feeBumpHandler(
       );
     }
 
-    const feeAmount = Math.floor(config.baseFee * config.feeMultiplier);
     const apiKeyConfig = res.locals.apiKey as ApiKeyConfig | undefined;
-
     if (!apiKeyConfig) {
-      res.status(500).json({
-        error: "Missing tenant context for fee sponsorship",
-      });
-      return;
+      return next(
+        new AppError(
+          "Missing tenant context for fee sponsorship",
+          500,
+          "INTERNAL_ERROR"
+        )
+      );
     }
 
     const tenant = syncTenantFromApiKey(apiKeyConfig);
+    const operationCount = innerTransaction.operations?.length || 0;
+    const feeAmount = calculateFeeBumpFee(
+      operationCount,
+      config.baseFee,
+      config.feeMultiplier
+    );
     const quotaCheck = checkTenantDailyQuota(tenant, feeAmount);
 
     if (!quotaCheck.allowed) {
@@ -112,15 +111,6 @@ export async function feeBumpHandler(
       });
       return;
     }
-    // Extract operation count safely
-    const operationCount = innerTransaction.operations?.length || 0;
-
-    // Use extracted utility for correct fee calculation
-    const feeAmount = calculateFeeBumpFee(
-      operationCount,
-      config.baseFee,
-      config.feeMultiplier,
-    );
 
     console.log("Fee calculation:", {
       operationCount,
@@ -129,64 +119,76 @@ export async function feeBumpHandler(
       finalFee: feeAmount,
     });
 
-    const feePayerKeypair = StellarSdk.Keypair.fromSecret(
-      config.feePayerSecret,
-    );
-
     const feeBumpTx = StellarSdk.TransactionBuilder.buildFeeBumpTransaction(
       feePayerAccount.keypair,
-      feeAmount,
+      feeAmount.toString(),
       innerTransaction,
-      config.networkPassphrase,
+      config.networkPassphrase
     );
 
-    feeBumpTx.sign(feePayerKeypair);
+    feeBumpTx.sign(feePayerAccount.keypair);
     recordSponsoredTransaction(tenant.id, feeAmount);
 
     const feeBumpXdr = feeBumpTx.toXDR();
-    console.log(`Fee-bump transaction created | fee_payer: ${feePayerAccount.publicKey}`);
+    console.log(
+      `Fee-bump transaction created | fee_payer: ${feePayerAccount.publicKey}`
+    );
 
-    const submit = body.submit || false;
-    const status = submit ? "submitted" : "ready";
-
-    if (submit && config.horizonUrl) {
-      const server = new StellarSdk.Horizon.Server(config.horizonUrl);
-
-      server
-        .submitTransaction(feeBumpTx)
-        .then((result: any) => {
-          // Track the submitted transaction
-          transactionStore.addTransaction(result.hash, "submitted");
-
-          const response: FeeBumpResponse = {
-            xdr: feeBumpXdr,
-            status: "submitted",
-            hash: result.hash,
-            fee_payer: feePayerAccount.publicKey,
-          };
-          res.json(response);
-        })
-        .catch((error: any) => {
-          console.error("Transaction submission failed:", error);
-          next(
-            new AppError(
-              `Transaction submission failed: ${error.message}`,
-              500,
-              "SUBMISSION_FAILED"
-            )
-          );
-        });
-      }
-    } else {
+    if (!body.submit) {
       const response: FeeBumpResponse = {
         xdr: feeBumpXdr,
-        status,
+        status: "ready",
         fee_payer: feePayerAccount.publicKey,
       };
-
       res.json(response);
+      return;
     }
-  } catch (error: any) {
+
+    if (config.horizonUrls.length === 0) {
+      return next(
+        new AppError(
+          "Transaction submission requested but no Horizon URLs are configured",
+          500,
+          "SUBMISSION_FAILED"
+        )
+      );
+    }
+
+    const horizonClient = getHorizonFailoverClient();
+    if (!horizonClient) {
+      return next(
+        new AppError(
+          "Horizon failover client is not initialized",
+          500,
+          "SUBMISSION_FAILED"
+        )
+      );
+    }
+
+    try {
+      const submission = await horizonClient.submitTransaction(feeBumpTx);
+      transactionStore.addTransaction(submission.result.hash, "submitted");
+
+      const response: FeeBumpResponse = {
+        xdr: feeBumpXdr,
+        status: "submitted",
+        hash: submission.result.hash,
+        fee_payer: feePayerAccount.publicKey,
+        submitted_via: submission.nodeUrl,
+        submission_attempts: submission.attempts,
+      };
+      res.json(response);
+    } catch (error: any) {
+      console.error("Transaction submission failed:", error);
+      return next(
+        new AppError(
+          `Transaction submission failed: ${error.message}`,
+          500,
+          "SUBMISSION_FAILED"
+        )
+      );
+    }
+  } catch (error) {
     console.error("Error processing fee-bump request:", error);
     next(error);
   }
